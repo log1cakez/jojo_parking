@@ -1,0 +1,478 @@
+#include <SPI.h>
+#include <MFRC522.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <ESP32Servo.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <ArduinoJson.h>
+
+// Pin Definitions
+#define RFID_SS   15
+#define RFID_RST  32
+#define US1_TRIG  5
+#define US1_ECHO  34
+#define US2_TRIG  17
+#define US2_ECHO  35
+#define US3_TRIG  16
+#define US3_ECHO  33
+#define SERVO_ENTRANCE 13
+#define SERVO_EXIT 12
+#define LED_GREEN 25
+#define LED_RED 26
+#define BTN_ENTRANCE 14
+#define BTN_EXIT 27
+#define BUZZER_PIN 4
+
+// WiFi Configuration
+const char* ssid = "Infinix SMART 8 Pro";
+const char* password = "bahoglubot";
+// Your existing URL is correct - no changes needed here
+const char* serverURL = "http://192.168.197.125/parking_api.php";
+// Object Instances
+MFRC522 mfrc522(RFID_SS, RFID_RST);
+Servo servoEntrance;
+Servo servoExit;
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// System Variables
+bool slot1Occupied = false;
+bool slot2Occupied = false;
+bool slot3Occupied = false;
+bool entranceGateOpen = false;
+bool exitGateOpen = false;
+String currentCardUID = "";
+
+unsigned long lastDisplayUpdate = 0;
+unsigned long lastRFIDCheck = 0;
+unsigned long lastUltrasonicCheck = 0;
+unsigned long lastDatabaseUpdate = 0;
+
+const unsigned long displayUpdateInterval = 1000;
+const unsigned long rfidCheckInterval = 250;
+const unsigned long ultrasonicInterval = 1000;
+const unsigned long databaseUpdateInterval = 3000; // Reduced to 3 seconds
+
+// Authorized RFID Cards
+byte authorizedCards[][4] = {
+  {0x73, 0xC7, 0x1F, 0x14},
+  {0xC3, 0x4E, 0x18, 0x28}
+};
+
+// ========== LCD FUNCTIONS ==========
+void displayCenteredMessage(String line1, String line2) {
+  lcd.clear();
+  
+  if (line1.length() < 16) {
+    int startPos = (16 - line1.length()) / 2;
+    lcd.setCursor(startPos, 0);
+  } else {
+    lcd.setCursor(0, 0);
+  }
+  lcd.print(line1);
+  
+  if (line2.length() < 16) {
+    int startPos = (16 - line2.length()) / 2;
+    lcd.setCursor(startPos, 1);
+  } else {
+    lcd.setCursor(0, 1);
+  }
+  lcd.print(line2);
+}
+
+void updateLCDStatus() {
+  lcd.clear();
+  
+  lcd.setCursor(0, 0);
+  lcd.print("S1:");
+  lcd.print(slot1Occupied ? "F " : "E ");
+  lcd.print("S2:");
+  lcd.print(slot2Occupied ? "F " : "E ");
+  lcd.print("S3:");
+  lcd.print(slot3Occupied ? "F" : "E");
+  
+  lcd.setCursor(0, 1);
+  int availableSlots = (!slot1Occupied) + (!slot2Occupied) + (!slot3Occupied);
+  String statusText = "Free:" + String(availableSlots) + "/3";
+  if (availableSlots == 0) {
+    statusText = "PARKING FULL";
+  }
+  
+  int startPos = (16 - statusText.length()) / 2;
+  if (startPos < 0) startPos = 0;
+  lcd.setCursor(startPos, 1);
+  lcd.print(statusText);
+}
+
+// ========== SERVO FUNCTIONS ==========
+void openEntranceGate() {
+  if (!entranceGateOpen) {
+    servoEntrance.write(90);
+    digitalWrite(LED_GREEN, HIGH);
+    digitalWrite(LED_RED, LOW);
+    entranceGateOpen = true;
+    Serial.println("Entrance gate opened");
+    
+    // Log gate opening to database
+    logToDatabase("gate_action", "entrance_open", "success");
+  }
+}
+
+void closeEntranceGate() {
+  if (entranceGateOpen) {
+    servoEntrance.write(0);
+    digitalWrite(LED_GREEN, LOW);
+    digitalWrite(LED_RED, HIGH);
+    entranceGateOpen = false;
+    Serial.println("Entrance gate closed");
+  }
+}
+
+void openExitGate() {
+  if (!exitGateOpen) {
+    servoExit.write(90);
+    exitGateOpen = true;
+    Serial.println("Exit gate opened");
+    
+    // Log gate opening to database
+    logToDatabase("gate_action", "exit_open", "success");
+  }
+}
+
+void closeExitGate() {
+  if (exitGateOpen) {
+    servoExit.write(0);
+    exitGateOpen = false;
+    Serial.println("Exit gate closed");
+  }
+}
+
+// ========== ULTRASONIC FUNCTIONS ==========
+long readUltrasonic(int trigPin, int echoPin) {
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+  
+  long duration = pulseIn(echoPin, HIGH, 30000);
+  if (duration == 0) {
+    return 200;
+  }
+  return (duration * 0.034) / 2;
+}
+
+void checkUltrasonicSensors() {
+  long distance1 = readUltrasonic(US1_TRIG, US1_ECHO);
+  long distance2 = readUltrasonic(US2_TRIG, US2_ECHO);
+  long distance3 = readUltrasonic(US3_TRIG, US3_ECHO);
+  
+  bool newSlot1 = (distance1 < 25);
+  bool newSlot2 = (distance2 < 25);
+  bool newSlot3 = (distance3 < 25);
+  
+  if (newSlot1 != slot1Occupied || newSlot2 != slot2Occupied || newSlot3 != slot3Occupied) {
+    slot1Occupied = newSlot1;
+    slot2Occupied = newSlot2;
+    slot3Occupied = newSlot3;
+    
+    Serial.print("Slots: ");
+    Serial.print(slot1Occupied ? "1-F " : "1-E ");
+    Serial.print(slot2Occupied ? "2-F " : "2-E ");
+    Serial.println(slot3Occupied ? "3-F" : "3-E");
+    
+    // Immediate database update when slots change
+    updateParkingStatus();
+  }
+}
+
+// ========== RFID FUNCTIONS ==========
+String getCardUID() {
+  String uidString = "";
+  for (byte i = 0; i < mfrc522.uid.size; i++) {
+    if (mfrc522.uid.uidByte[i] < 0x10) {
+      uidString += "0";
+    }
+    uidString += String(mfrc522.uid.uidByte[i], HEX);
+  }
+  uidString.toUpperCase();
+  return uidString;
+}
+
+bool isAuthorizedCard() {
+  for (byte i = 0; i < sizeof(authorizedCards) / sizeof(authorizedCards[0]); i++) {
+    bool match = true;
+    for (byte j = 0; j < 4; j++) {
+      if (mfrc522.uid.uidByte[j] != authorizedCards[i][j]) {
+        match = false;
+        break;
+      }
+    }
+    if (match) return true;
+  }
+  return false;
+}
+
+void checkRFID() {
+  if (!mfrc522.PICC_IsNewCardPresent()) return;
+  if (!mfrc522.PICC_ReadCardSerial()) return;
+  
+  currentCardUID = getCardUID();
+  Serial.print("Card detected: ");
+  Serial.println(currentCardUID);
+  
+  if (isAuthorizedCard()) {
+    int availableSlots = (!slot1Occupied) + (!slot2Occupied) + (!slot3Occupied);
+    if (availableSlots > 0) {
+      displayCenteredMessage("ACCESS GRANTED", "PRESS ENTRANCE");
+      systemBeep(2);
+      logToDatabase(currentCardUID, "entry", "granted");
+    } else {
+      displayCenteredMessage("PARKING FULL", "ACCESS DENIED");
+      systemBeep(3);
+      logToDatabase(currentCardUID, "entry", "denied_full");
+    }
+  } else {
+    displayCenteredMessage("UNAUTHORIZED", "ACCESS DENIED");
+    systemBeep(3);
+    logToDatabase(currentCardUID, "entry", "denied_unauthorized");
+  }
+  
+  delay(2000);
+  updateLCDStatus();
+  mfrc522.PICC_HaltA();
+  mfrc522.PCD_StopCrypto1();
+}
+
+// ========== BUTTON FUNCTIONS ==========
+void checkButtons() {
+  bool entranceBtn = (digitalRead(BTN_ENTRANCE) == LOW);
+  bool exitBtn = (digitalRead(BTN_EXIT) == LOW);
+  
+  if (entranceBtn && exitBtn) {
+    openEntranceGate();
+    openExitGate();
+    displayCenteredMessage("EMERGENCY MODE", "GATES OPEN");
+    systemBeep(4);
+    logToDatabase("emergency", "both_gates", "opened");
+    return;
+  }
+  
+  if (entranceBtn) {
+    openEntranceGate();
+  } else {
+    closeEntranceGate();
+  }
+  
+  if (exitBtn) {
+    openExitGate();
+  } else {
+    closeExitGate();
+  }
+}
+
+// ========== BUZZER FUNCTIONS ==========
+void beep(int frequency, int duration) {
+  tone(BUZZER_PIN, frequency, duration);
+  delay(duration + 50);
+}
+
+void systemBeep(int type) {
+  switch (type) {
+    case 1: // Startup
+      beep(1000, 200);
+      delay(100);
+      beep(1500, 200);
+      break;
+    case 2: // Success
+      beep(1500, 300);
+      break;
+    case 3: // Error
+      beep(500, 500);
+      break;
+    case 4: // Emergency
+      beep(800, 200);
+      delay(100);
+      beep(800, 200);
+      delay(100);
+      beep(800, 200);
+      break;
+  }
+}
+
+// ========== WIFI FUNCTIONS ==========
+void connectToWiFi() {
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  displayCenteredMessage("Connecting", "to WiFi...");
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(1000);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\nWiFi connected!");
+    Serial.print("IP: ");
+    Serial.println(WiFi.localIP());
+    displayCenteredMessage("WiFi CONNECTED", WiFi.localIP().toString());
+  } else {
+    Serial.println("\nWiFi failed!");
+    displayCenteredMessage("WiFi FAILED", "Check credentials");
+  }
+  delay(2000);
+}
+
+// ========== DATABASE FUNCTIONS ==========
+void updateParkingStatus() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - skipping DB update");
+    return;
+  }
+  
+  HTTPClient http;
+  http.begin(serverURL);
+  http.addHeader("Content-Type", "application/json");
+  
+  String jsonData = "{";
+  jsonData += "\"slot1\":\"" + String(slot1Occupied ? "occupied" : "empty") + "\",";
+  jsonData += "\"slot2\":\"" + String(slot2Occupied ? "occupied" : "empty") + "\",";
+  jsonData += "\"slot3\":\"" + String(slot3Occupied ? "occupied" : "empty") + "\",";
+  jsonData += "\"entrance_gate\":\"" + String(entranceGateOpen ? "open" : "closed") + "\",";
+  jsonData += "\"exit_gate\":\"" + String(exitGateOpen ? "open" : "closed") + "\"";
+  jsonData += "}";
+  
+  Serial.println("Sending parking status: " + jsonData);
+  
+  int httpCode = http.POST(jsonData);
+  
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("DB Response: " + response);
+  } else {
+    Serial.println("HTTP Error: " + String(httpCode));
+  }
+  
+  http.end();
+}
+
+void logToDatabase(String cardUID, String action, String status) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected - skipping log");
+    return;
+  }
+  
+  HTTPClient http;
+  http.begin(serverURL);
+  http.addHeader("Content-Type", "application/json");
+  
+  String jsonData = "{";
+  jsonData += "\"card_uid\":\"" + cardUID + "\",";
+  jsonData += "\"action\":\"" + action + "\",";
+  jsonData += "\"status\":\"" + status + "\"";
+  jsonData += "}";
+  
+  Serial.println("Logging access: " + jsonData);
+  
+  int httpCode = http.POST(jsonData);
+  
+  if (httpCode > 0) {
+    String response = http.getString();
+    Serial.println("Log Response: " + response);
+  } else {
+    Serial.println("HTTP Error: " + String(httpCode));
+  }
+  
+  http.end();
+}
+
+void updateDatabase() {
+  // Regular database update (called every 3 seconds)
+  updateParkingStatus();
+}
+
+// ========== SETUP ==========
+void setup() {
+  Serial.begin(115200);
+  Serial.println("Starting Smart Parking System...");
+  
+  // Initialize LCD
+  lcd.init();
+  lcd.backlight();
+  displayCenteredMessage("Smart Parking", "System Starting");
+  delay(2000);
+  
+  // Connect to WiFi
+  connectToWiFi();
+  
+  // Initialize RFID
+  SPI.begin(18, 19, 23, 15);
+  mfrc522.PCD_Init();
+  
+  // Initialize ultrasonic sensors
+  pinMode(US1_TRIG, OUTPUT);
+  pinMode(US1_ECHO, INPUT);
+  pinMode(US2_TRIG, OUTPUT);
+  pinMode(US2_ECHO, INPUT);
+  pinMode(US3_TRIG, OUTPUT);
+  pinMode(US3_ECHO, INPUT);
+  
+  // Initialize servos
+  servoEntrance.attach(SERVO_ENTRANCE);
+  servoExit.attach(SERVO_EXIT);
+  closeEntranceGate();
+  closeExitGate();
+  
+  // Initialize LEDs
+  pinMode(LED_GREEN, OUTPUT);
+  pinMode(LED_RED, OUTPUT);
+  digitalWrite(LED_GREEN, LOW);
+  digitalWrite(LED_RED, HIGH);
+  
+  // Initialize buttons
+  pinMode(BTN_ENTRANCE, INPUT_PULLUP);
+  pinMode(BTN_EXIT, INPUT_PULLUP);
+  
+  // Initialize buzzer
+  pinMode(BUZZER_PIN, OUTPUT);
+  
+  // Startup beep
+  systemBeep(1);
+  updateLCDStatus();
+  
+  // Initial database update
+  updateDatabase();
+  
+  Serial.println("System ready!");
+}
+
+// ========== MAIN LOOP ==========
+void loop() {
+  unsigned long currentMillis = millis();
+  
+  if (currentMillis - lastUltrasonicCheck >= ultrasonicInterval) {
+    lastUltrasonicCheck = currentMillis;
+    checkUltrasonicSensors();
+  }
+  
+  if (currentMillis - lastRFIDCheck >= rfidCheckInterval) {
+    lastRFIDCheck = currentMillis;
+    checkRFID();
+  }
+  
+  checkButtons();
+  
+  if (currentMillis - lastDisplayUpdate >= displayUpdateInterval) {
+    lastDisplayUpdate = currentMillis;
+    updateLCDStatus();
+  }
+  
+  if (currentMillis - lastDatabaseUpdate >= databaseUpdateInterval) {
+    lastDatabaseUpdate = currentMillis;
+    updateDatabase();
+  }
+  
+  delay(10);
+}
